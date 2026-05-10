@@ -1,0 +1,379 @@
+# URL Shortener — restgen example
+# Uses Redis for storage, rate limiting via slowapi
+#
+# Run:
+#   python -m src.restgen compile examples/url_shortener/api.yaml --out examples/url_shortener/generated -v
+#   cd examples/url_shortener && uvicorn generated.app:app --port 8000
+
+name: url_shortener
+version: "2.0"
+description: "URL shortener with Redis storage, rate limiting, link expiration, QR codes, detailed analytics, bulk creation, link editing, tags, password protection, slug validation, webhooks, and OG metadata preview"
+
+database:
+  type: redis
+  url: redis://localhost:6379/0
+
+dependencies:
+  - httpx>=0.27
+  - python-dotenv>=1.0
+  - qrcode[pil]>=7.4
+  - better-profanity>=0.7
+  - aiosqlite>=0.19
+  - beautifulsoup4>=4.12
+  - Pillow>=10.0
+
+docs:
+  docs_url: /api/docs
+  redoc_url: /api/redoc
+  openapi_url: /api/schema.json
+
+models:
+  # Core record stored in Redis — extended with expiration, tags, password, OG metadata
+  ShortLink:
+    fields:
+      id:              { type: str, primary: true }                      # the alias (e.g. "abc123")
+      original_url:    { type: str, min_length: 1, max_length: 2048 }
+      clicks:          { type: int, default: 0 }
+      created_at:      { type: datetime, auto_now: true }
+      expires_at:      { type: datetime, optional: true }                # link expiration timestamp
+      tags:            { type: list, items: str, optional: true }        # user-defined tags
+      password_hash:   { type: str, optional: true }                     # bcrypt hash if password protected
+      og_title:        { type: str, optional: true }                     # cached OG title
+      og_description:  { type: str, optional: true }                     # cached OG description
+      og_image:        { type: str, optional: true }                     # cached OG image URL
+
+  # POST /shorten request body
+  CreateLinkRequest:
+    fields:
+      url:          { type: str, min_length: 1, max_length: 2048 }
+      custom_alias: { type: str, optional: true, min_length: 3, max_length: 20 }
+
+  # POST /shorten response
+  CreateLinkResponse:
+    fields:
+      short_url:    { type: str }
+      original_url: { type: str }
+      alias:        { type: str }
+
+  # GET /{alias}/stats response
+  LinkStats:
+    fields:
+      alias:        { type: str }
+      original_url: { type: str }
+      clicks:       { type: int }
+      created_at:   { type: datetime }
+
+  # --- Bulk creation ---
+
+  # POST /shorten/bulk request body — create up to 50 links at once
+  BulkCreateRequest:
+    fields:
+      urls:            { type: list, items: str }
+      custom_aliases:  { type: list, items: str, optional: true }
+      expires_at:      { type: datetime, optional: true }
+      tags:            { type: list, items: str, optional: true }
+
+  # Per-URL error in a bulk request
+  BulkError:
+    fields:
+      index:  { type: int }
+      url:    { type: str }
+      reason: { type: str }
+
+  # POST /shorten/bulk response — created links plus per-URL errors
+  BulkCreateResponse:
+    fields:
+      created: { type: list, items: CreateLinkResponse }
+      errors:  { type: list, items: BulkError }
+
+  # --- Link editing ---
+
+  # PATCH /links/{alias} request body — all fields optional, only supplied ones update
+  UpdateLinkRequest:
+    fields:
+      original_url: { type: str, optional: true, max_length: 2048 }
+      expires_at:   { type: datetime, optional: true }
+      tags:         { type: list, items: str, optional: true }
+      password:     { type: str, optional: true }
+
+  # --- Password protection ---
+
+  # POST /{alias}/access request body — unlock password-protected link
+  PasswordAccessRequest:
+    fields:
+      password: { type: str, min_length: 1 }
+
+  # POST /{alias}/access response — original URL revealed after auth
+  PasswordAccessResponse:
+    fields:
+      original_url: { type: str }
+      alias:        { type: str }
+
+  # --- Webhooks ---
+
+  # POST /webhooks request body — register webhook for a given event
+  WebhookCreateRequest:
+    fields:
+      url:           { type: str, max_length: 2048 }
+      event:         { type: enum, values: [click, link_created, link_expired, milestone] }
+      alias_filter:  { type: str, optional: true }
+
+  # Persisted webhook configuration
+  WebhookConfig:
+    fields:
+      id:            { type: str, primary: true }
+      url:           { type: str }
+      event:         { type: str }
+      alias_filter:  { type: str, optional: true }
+      created_at:    { type: datetime, auto_now: true }
+
+  # Webhook API response shape
+  WebhookResponse:
+    fields:
+      id:            { type: str }
+      url:           { type: str }
+      event:         { type: str }
+      alias_filter:  { type: str, optional: true }
+      created_at:    { type: datetime }
+
+  # --- OG metadata preview ---
+
+  # GET /{alias}/preview response — Open Graph metadata from the target URL
+  OGMetadata:
+    fields:
+      alias:       { type: str }
+      title:       { type: str, optional: true }
+      description: { type: str, optional: true }
+      image:       { type: str, optional: true }
+      fetched_at:  { type: datetime }
+
+  # --- Detailed analytics ---
+
+  # Daily click count bucket
+  DailyClickCount:
+    fields:
+      date:  { type: str }
+      count: { type: int }
+
+  # GET /{alias}/analytics response — click breakdowns by dimension
+  DetailedAnalytics:
+    fields:
+      alias:              { type: str }
+      total_clicks:       { type: int }
+      clicks_by_browser:  { type: dict, keys: str, values: int }
+      clicks_by_os:       { type: dict, keys: str, values: int }
+      clicks_by_device:   { type: dict, keys: str, values: int }
+      clicks_by_referrer: { type: dict, keys: str, values: int }
+      daily_clicks:       { type: list, items: DailyClickCount }
+
+  # --- Tag listing ---
+
+  # GET /admin/links/by-tag/{tag} response — all links carrying a given tag
+  TagListResponse:
+    fields:
+      links: { type: list, items: ShortLink }
+      tag:   { type: str }
+      count: { type: int }
+
+errors:
+  NotFound:
+    status: 404
+    body: { message: "Short link not found" }
+
+  AliasConflict:
+    status: 409
+    body: { message: "Alias already taken" }
+
+  InvalidUrl:
+    status: 422
+    body: { message: "Invalid URL format" }
+
+  LinkExpired:
+    status: 410
+    body: { message: "This link has expired" }
+
+  PasswordRequired:
+    status: 403
+    body: { message: "This link is password protected" }
+
+  InvalidPassword:
+    status: 403
+    body: { message: "Incorrect password" }
+
+  InvalidSlug:
+    status: 422
+    body: { message: "Alias contains reserved or inappropriate words" }
+
+  BulkLimitExceeded:
+    status: 400
+    body: { message: "Bulk operation limited to 50 URLs" }
+
+  WebhookNotFound:
+    status: 404
+    body: { message: "Webhook not found" }
+
+routes:
+  # --- Tier 3: Custom handlers ---
+
+  # Create a short link (generates or accepts custom alias)
+  - path: /shorten
+    method: POST
+    handler: handlers.shortener.create_short_link
+    request_model: CreateLinkRequest
+    response_model: CreateLinkResponse
+    errors:
+      alias_taken:  AliasConflict
+      invalid_url:  InvalidUrl
+      invalid_slug: InvalidSlug
+    tags: [links]
+
+  # Redirect to original URL (tracks clicks; respects expiration + password protection)
+  - path: /{alias}
+    method: GET
+    handler: handlers.shortener.redirect_to_url
+    errors:
+      not_found:         NotFound
+      link_expired:      LinkExpired
+      password_required: PasswordRequired
+    tags: [redirect]
+
+  # --- Tier 2: Pipeline ---
+
+  # Get link stats (fetch + transform)
+  - path: /{alias}/stats
+    method: GET
+    response_model: LinkStats
+    errors:
+      not_found: NotFound
+    pipeline:
+      - action: db.get
+        model: ShortLink
+        args: { id: "$path.alias" }
+        as: link
+      - action: transform
+        handler: handlers.shortener.format_stats
+        args: { link: "$link" }
+        as: stats
+    tags: [stats]
+
+  # --- Tier 1: CRUD (admin) ---
+
+  # List all links
+  - path: /admin/links
+    method: GET
+    action: db.list
+    model: ShortLink
+    pagination: { default_limit: 50, max_limit: 200 }
+    tags: [admin]
+
+  # Delete a link
+  - path: /admin/links/{id}
+    method: DELETE
+    action: db.delete
+    model: ShortLink
+    errors:
+      not_found: NotFound
+    tags: [admin]
+
+  # --- New feature routes ---
+
+  # QR code generation — returns PNG bytes for the short link
+  - path: /{alias}/qr
+    method: GET
+    handler: handlers.qr.generate_qr
+    errors:
+      not_found: NotFound
+    tags: [qr]
+
+  # Detailed analytics — per-browser/OS/device/referrer breakdowns plus daily counts
+  - path: /{alias}/analytics
+    method: GET
+    handler: handlers.analytics.get_analytics
+    response_model: DetailedAnalytics
+    errors:
+      not_found: NotFound
+    tags: [analytics]
+
+  # Bulk creation — create up to 50 short links in a single request
+  - path: /shorten/bulk
+    method: POST
+    handler: handlers.shortener.bulk_create_links
+    request_model: BulkCreateRequest
+    response_model: BulkCreateResponse
+    errors:
+      bulk_limit: BulkLimitExceeded
+    tags: [links]
+
+  # Edit/update an existing link's target, expiration, tags, or password
+  - path: /links/{alias}
+    method: PATCH
+    handler: handlers.shortener.update_link
+    request_model: UpdateLinkRequest
+    errors:
+      not_found: NotFound
+    tags: [links]
+
+  # Get links by tag
+  - path: /admin/links/tagged/{tag}
+    method: GET
+    handler: handlers.shortener.get_links_by_tag
+    response_model: TagListResponse
+    errors:
+      not_found: NotFound
+    tags: [admin, tags]
+
+  # Password-protected link access — submit password, get target URL
+  - path: /{alias}/access
+    method: POST
+    handler: handlers.shortener.password_access
+    request_model: PasswordAccessRequest
+    response_model: PasswordAccessResponse
+    errors:
+      not_found:        NotFound
+      invalid_password: InvalidPassword
+    tags: [redirect]
+
+  # --- Webhook management ---
+
+  # Register a new webhook for link events
+  - path: /webhooks
+    method: POST
+    handler: handlers.webhooks.create_webhook
+    request_model: WebhookCreateRequest
+    response_model: WebhookResponse
+    tags: [webhooks]
+
+  # List all registered webhooks
+  - path: /webhooks
+    method: GET
+    handler: handlers.webhooks.list_webhooks
+    tags: [webhooks]
+
+  # Delete a webhook
+  - path: /webhooks/{webhook_id}
+    method: DELETE
+    handler: handlers.webhooks.delete_webhook
+    errors:
+      not_found: WebhookNotFound
+    tags: [webhooks]
+
+  # OG metadata preview — fetch Open Graph tags from the target URL
+  - path: /{alias}/preview
+    method: GET
+    handler: handlers.og_preview.fetch_og_metadata
+    response_model: OGMetadata
+    errors:
+      not_found: NotFound
+    tags: [preview]
+
+middleware:
+  - kind: cors
+    config:
+      origins: ["*"]
+      methods: ["*"]
+      headers: ["*"]
+
+  - kind: rate_limit
+    config:
+      rate: "30/minute"
+      storage_uri: "redis://localhost:6379/1"
